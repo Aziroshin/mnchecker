@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+#-*- coding: utf-8 -*-
+
+#Copyright (c) 2017 Christian Knuchel
+
+#Permission is hereby granted, free of charge, to any person obtaining a copy
+#of this software and associated documentation files (the "Software"), to deal
+#in the Software without restriction, including without limitation the rights
+#to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+#copies of the Software, and to permit persons to whom the Software is
+#furnished to do so, subject to the following conditions:
+
+#The above copyright notice and this permission notice shall be included in all
+#copies or substantial portions of the Software.
+
+#THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+#IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+#FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+#AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+#LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+#OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+#SOFTWARE.
+
+#=======================================================================================
+# Imports
+#=======================================================================================
+
+import os
+import sys
+import argparse
+import time
+import fnmatch
+import shutil
+import urllib.request
+from subprocess import Popen, PIPE
+
+#=======================================================================================
+# Configuration
+#=======================================================================================
+
+#==========================================================
+# Currency defaults
+defaultCurrencyHandle = "vivo"
+defaultCliBin = "vivo-cli"
+defaultDaemonBin = "vivod"
+defaultDataDir = os.path.join(os.path.expanduser("~"), ".vivocore")
+
+#==========================================================
+# Auxiliary Files
+blockCountCacheFileDirectoryPath = "/tmp"
+blockCountCacheFileNameTemplate = "blockheightguard_{explorerName}_{currencyHandle}_blockheight"
+blockCountFixLockFileName = ".blockCountFixInProgress"
+
+#==========================================================
+# Formula
+#==========================================================
+
+# When the discrepancy between the explorer's and the wallet's block count is too great,
+# the wallet's blockchain data is reset. As re-synchronizing with the network takes time,
+# there needs to be grace time, so the script doesn't detect an obviously critical
+# discrepancy between the freshly being synced blockchain data (which is likely still to have
+# a low blockcount the next time the script checks), causing it to go into an endless
+# cycle of resetting the wallet's blockchain data.
+#
+# That grace time is determined by the formula as specified by the below function,
+# for which configuration variables are provided below, with their values in seconds.
+
+#=============================
+# Minimal wait time, no matter the block count.
+blockCountFixGraceTimeMin = 1800
+
+#=============================
+# By how much the explorer's block count is multiplied to increase or decrease the
+# additional grace time to the minimum grace time.
+blockCountFixGraceTimeMultiplier = 1.0
+
+#=============================
+# This function is provided for configurability for those who would like to change
+# the very formula itself:
+def blockCountFixGraceTime(explorerBlockCount):
+	return int(blockCountFixGraceTimeMin + explorerBlockCount * blockCountFixGraceTimeMultiplier)
+
+#==========================================================
+# Wait time until the explorer's block count value is updated to the cache file.
+explorerQueryInterval = 300
+
+#==========================================================
+# Maximum block difference between the wallet's and the explorer's block count
+# for the wallet's block count being considered healthy.
+defaultThreshold = 5
+
+#=======================================================================================
+# Arguments
+#=======================================================================================
+argumentParser = argparse.ArgumentParser()
+
+# Currency handle/name/symbol (this is dependent on what the exchange wants to see).
+argumentParser.add_argument("-n", "--currency-handle", default=defaultCurrencyHandle,\
+	help="Symbol or name of the currency in question. Depends on the explorer used. Default: {default}".\
+	format(default=defaultCurrencyHandle))
+argumentParser.add_argument("-b", "--currency-bin-cli",default=defaultCliBin,\
+	help="Command line wallet binary path. Default: {default}".\
+	format(default=defaultCliBin))
+argumentParser.add_argument("-e", "--currency-bin-daemon", default=defaultDaemonBin,\
+	help="Daemon binary path. Default: {default}".\
+	format(default=defaultDaemonBin))
+argumentParser.add_argument("-d", "--currency-datadir", default=defaultDataDir,\
+	help="Datadir used for this particular wallet instance. Default: {default}".\
+	format(default=defaultDataDir))
+argumentParser.add_argument("-c", "--currency-conf",\
+	help="Path of the wallet's configuration file. If not specified, it will not be used.")
+argumentParser.add_argument("-t", "--threshold", default=defaultThreshold,\
+	help="Maximum difference between explorer and wallet block count that is considered healthy\
+	and won't trigger the fix. Default value: {default}. Increase for very new coins.".\
+	format(default=defaultThreshold))
+
+args = argumentParser.parse_args()
+
+
+#=======================================================================================
+# Library
+#=======================================================================================
+
+#==========================================================
+class WalletConnectionError(Exception):
+	def __init__(self, message):
+		super().__init__(message)
+
+#==========================================================
+class DaemonStuckError(Exception):
+	def __init__(self, message):
+		super().__init__(message)
+
+#==========================================================
+class Currency(object):
+	"""Represents the wallet's currency."""
+	def __init__(self, handle):
+		self.handle = handle
+
+#==========================================================
+class Process(object):
+
+	"""Represents a system process started by this script.
+	Note: Refrain from calling .communicate() directly on the process from outside of this object."""
+
+	def __init__(self, commandLine, run=True):
+		self.commandLine = commandLine
+		if run == True:
+			self.run()
+		self._communicated = False
+		self._stdout = None
+		self._stderr = None
+
+	def run(self):
+		self.process = Popen(self.commandLine, stdout=PIPE, stderr=PIPE)
+		return self.process
+
+	def waitAndGetOutput(self, timeout=None):
+		if not self._communicated:
+			self._stdout, self._stderr = self.process.communicate(timeout=timeout)
+			self._communicated = True
+		return (self._stdout, self._stderr)
+
+	def waitAndGetStdout(self, timeout=None):
+		return self.waitAndGetOutput(timeout)[0]
+
+	def waitAndGetStderr(self, timeout=None):
+		return self.waitAndGetOutput(timeout)[1]
+
+#==========================================================
+class Wallet(object):
+	
+	#=============================
+	"""Represents everything this script needs related to a bitcoin derived wallet."""
+	#=============================
+	
+	def __init__(self, currency, cliBinPath, daemonBinPath, confFilePath, dataDirPath):
+		self.currency = currency
+		self.cliBinPath = cliBinPath
+		self.daemonBinPath = daemonBinPath
+		self.confFilePath = confFilePath
+		self.dataDirPath = dataDirPath
+
+	def runCli(self, commandLine):
+		"""Run the command line version of the wallet with a list of command line arguments."""
+		if not self.confFilePath == None:
+			return Process([self.cliBinPath,\
+				"-datadir={datadir}".format(datadir=self.dataDirPath),\
+				"-conf={confFilePath}".format(confFilePath=self.confFilePath)] + commandLine)
+		else:
+			return Process([self.cliBinPath,\
+				"-datadir={datadir}".format(datadir=self.dataDirPath)] + commandLine)
+
+	def runDaemon(self, commandLine):
+		"""Run the daemon. Takes a list for command line arguments to it."""
+		if not self.confFilePath == None:
+			return Process([self.daemonBinPath,\
+				"-daemon",\
+				"-datadir={datadir}".format(datadir=self.dataDirPath),\
+				"-conf={confFilePath}".format(confFilePath=self.confFilePath)] +commandLine)
+		else:
+			return Process([self.daemonBinPath,\
+				"-daemon",\
+				"-datadir={datadir}".format(datadir=self.dataDirPath)] +commandLine)
+
+	def runCliSafe(self, commandLine, _retrying=False):
+		"""A version of .runCli that checks for the wallet tripping up and responds accordingly."""
+		process = self.runCli(commandLine)
+		stdoutString, stderrString = process.waitAndGetOutput()
+		# Catch the wallet taking the way out because the daemon isn't running.
+		if stderrString.decode().strip() == "error: couldn't connect to server":
+			raise WalletConnectionError(\
+				"Command line wallet can't connect to the daemon. Is the daemon running?")
+		# Catch issues caused by the wallet connecting to the daemon right after the daemon started.
+		# As this involves retrying, we have to make sure we don't get stuck retrying forever.
+		if "error code: -28" in stdoutString.decode()\
+			or "error code: -28" in stderrString.decode()\
+			and not _retrying:
+			# Rerun this method in intervals until it works, or we decide to give up.
+			for retry in range(1,16):
+				time.sleep(5)
+				retriedProcess = self.runCliSafe(commandLine, _retrying=True)
+				retriedStdoutString, retriedStderrString = retriedProcess.waitAndGetOutput()
+				if "error code: -28" in retriedStdoutString.decode()\
+					or "error code: -28" in retriedStderrString.decode():
+					continue
+				else:
+					return retriedProcess
+			raise DaemonStuckError("Daemon stuck at error -28")
+		return process
+
+	def runDaemonSafe(self, commandLine):
+		"""A version of .runDaemon that checks for the daemon tripping up and responds accordingly."""
+		process = self.runDaemon(commandLine)
+		stdoutString, stderrString = process.waitAndGetOutput()
+		#TODO: Make running the daemon safer and failures more verbose with some checks & exceptions.
+		return process
+
+	def startDaemon(self, commandLine=[]):
+		"""Start the daemon. Takes a list for command line arguments."""
+		return self.runDaemon(commandLine)
+
+	def stopDaemon(self, waitTimeout):
+		"""Stop the daemon.
+		The parameter 'waitTimeout' determines for how long we will wait and poll
+		for stop confirmation, in seconds."""
+		process = self.runCliSafe(["stop"])
+		# Wait and poll every second for daemon shutdown completion.
+		# Return once daemon shut down is confirmed.
+		if not waitTimeout == None:
+			for second in range(1,waitTimeout):
+				try:
+					self.getBlockCount() # We could use anything. This will do.
+				except WalletConnectionError:
+					break
+				time.sleep(1)
+		return process
+
+	def deleteBlockchainData(self):
+		for fileName in ["blocks", "chainstate", "database", "mncache.dat", "peers.dat", "mnpayments.dat", "banlist.dat"]:
+			filePath = os.path.join(self.dataDirPath, fileName)
+			if os.path.exists(filePath):
+				if os.path.isdir(filePath):
+					shutil.rmtree(filePath)
+				else:
+					os.remove(filePath)
+
+	def getBlockCount(self):
+		return int(self.runCliSafe(["getblockcount"]).waitAndGetStdout(timeout=8).decode())
+
+#==========================================================
+class File(object):
+	
+	#=============================
+	"""Basic file wrapper.
+	Abstracts away basic operations such as read, write, etc."""
+	#TODO: Make file operations safer and failures more verbose with some checks & excpetions.
+	#=============================
+	
+	def __init__(self, path, make=False):
+		self.path = path
+		if not os.path.exists(self.path) and make:
+			self.make()
+
+	@property
+	def lastModified(self):
+		return int(os.path.getmtime(self.path))
+
+	@property
+	def secondsSinceLastModification(self):
+		return int(time.time()) - int(self.lastModified)
+
+	@property
+	def exists(self):
+		return os.path.exists(self.path)
+
+	def write(self, data):
+		with open(self.path, "w") as fileHandler:
+			fileHandler.write(data)
+
+	def read(self):
+		with open(self.path, "r") as fileHandler:
+			return fileHandler.read()
+
+	def remove(self):
+			os.remove(self.path)
+
+	def make(self):
+		"""Write empty file to make sure it exists."""
+		self.write("")
+
+#==========================================================
+class BlockCountCacheFile(File):
+	
+	#=============================
+	"""Wrapper for the file the block explorer's block count data is cached in."""
+	#=============================
+	
+	def __init__(self, path):
+		super().__init__(path, make=True)
+
+#==========================================================
+class BlockCountFixLockFile(File):
+	
+	#=============================
+	"""Wrapper for the file used to determine whether the wallet has recently had its blockchain reset by this script.
+	It's not really a traditional lock file, though: It contains time data to determine whether
+	the grace waiting period to wait for the wallet's re-sync is over yet or not."""
+	#=============================
+	
+	def __init__(self, dataDirPath):
+		super().__init__(os.path.join(dataDirPath, blockCountFixLockFileName), make=False)
+
+#==========================================================
+class BlockExplorer(object):
+	
+	#=============================
+	"""Represents a block explorer to the extent of its relevance in terms of block count information."""
+	#=============================
+	
+	def __init__(self):
+		self.name = "NONE"
+	
+	def queryBlockCount(self, currency):
+		"""Override this with the actual code required to get the block count from a particular block explorer."""
+		pass # Override
+	
+	def getBlockCount(self, currency):
+		"""Gets and caches an explorer's block count.
+		The values are read from the cache file for a period. That file is updated with fresh information
+		if this method is called and that period is exceeded."""
+		blockCountCacheFile = BlockCountCacheFile(\
+			os.path.join( blockCountCacheFileDirectoryPath,\
+			blockCountCacheFileNameTemplate.format(\
+			explorerName=self.name, currencyHandle=currency.handle)))
+		if blockCountCacheFile.secondsSinceLastModification > explorerQueryInterval\
+			or blockCountCacheFile.read() == "":
+			# Data in the cache file is old, or nothing has been written to it yet.
+			# Get updated block count data and write it to it.
+			blockCountCacheFile.write(str( self.queryBlockCount(currency)))
+		return int(blockCountCacheFile.read())
+
+#==========================================================
+class ExplorerzTopBlockExplorer(BlockExplorer):
+	"""BlockExplorer implementation for explorerz.top."""
+	def __init__(self):
+		self.name = "explorerz.top"
+	def queryBlockCount(self, currency):
+		return urllib.request.urlopen(\
+			"http://{currencyHandle}.explorerz.top:3003/api/getblockcount".format(\
+			currencyHandle=currency.handle)).read().decode()
+
+#==========================================================
+class BlockCountHealth(object):
+
+	#=============================
+	"""Checks a wallet's block count against a block explorer's block count."""
+	#=============================
+
+	def __init__(self, wallet, explorer, threshold):
+		self.wallet = wallet
+		self.explorer = explorer
+		self.threshold = threshold
+		self.blockCountFixLockFile = BlockCountFixLockFile(self.wallet.dataDirPath)
+		# We're caching the block counts for the wallet and the block explorer for the
+		# life time of this object in order to make things a little more efficient.
+		self.walletBlockCount = self.wallet.getBlockCount()
+		self.explorerBlockCount = self.explorer.getBlockCount(self.wallet.currency)
+
+	@property
+	def isGood(self):
+		if self.explorer.getBlockCount(self.wallet.currency) - self.wallet.getBlockCount()> self.threshold:
+			return False # Block health is not good.
+		else:
+			return True # Block health is good.
+
+	@property
+	def blockCountFixInProgress(self):
+		inProgress = False
+		if self.blockCountFixLockFile.exists:
+			if int(time.time()) - int(self.blockCountFixLockFile.read())\
+				< blockCountFixGraceTime(self.explorerBlockCount):
+				inProgress = True
+		return inProgress
+
+	def fixBlockCount(self):
+		if not self.blockCountFixInProgress:
+			self.wallet.stopDaemon(waitTimeout=180)
+			#TODO: Perhaps properly deal with the above stop attempt timing out one way or another.
+			self.wallet.deleteBlockchainData()
+			self.blockCountFixLockFile.write(str(int(time.time())))
+			self.wallet.startDaemon(["-reindex"])
+
+	def maintain(self):
+		"""Check for block count health and fix if required."""
+		if not self.isGood:
+			#print(self.blockCountFixInProgress)
+			if not self.blockCountFixInProgress:
+				self.fixBlockCount()
+		else: # Block count health is good.
+			try:
+				self.blockCountFixLockFile.remove()
+			except FileNotFoundError:
+				pass
+
+#=======================================================================================
+# Action
+#=======================================================================================
+
+if __name__ == "__main__":
+	BlockCountHealth(\
+		Wallet(Currency(args.currency_handle),\
+		args.currency_bin_cli,\
+		args.currency_bin_daemon,\
+		args.currency_conf,\
+		args.currency_datadir),\
+		ExplorerzTopBlockExplorer(),\
+		threshold=args.threshold).maintain()
+	sys.exit(0)
