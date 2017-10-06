@@ -31,6 +31,7 @@ import argparse
 import time
 import fnmatch
 import shutil
+import logging
 import urllib.request
 from subprocess import Popen, PIPE
 
@@ -39,17 +40,28 @@ from subprocess import Popen, PIPE
 #=======================================================================================
 
 #==========================================================
+# Basics
+userDirName = ".mnchecker"
+
+#==========================================================
 # Currency defaults
 defaultCurrencyHandle = "vivo"
 defaultCliBin = "vivo-cli"
 defaultDaemonBin = "vivod"
-defaultDataDir = os.path.join(os.path.expanduser("~"), ".vivocore")
+defaultDataDir = os.path.join(os.path.abspath(os.path.expanduser("~")), ".vivocore")
 
 #==========================================================
 # Auxiliary Files
 blockCountCacheFileDirectoryPath = "/tmp"
 blockCountCacheFileNameTemplate = "blockheightguard_{explorerName}_{currencyHandle}_blockheight"
 blockCountFixLockFileName = ".blockCountFixInProgress"
+
+#==========================================================
+# Logging
+defaultLogFilePath=\
+	os.path.join(os.path.abspath(os.path.expanduser("~")),\
+	os.path.join(userDirName,\
+	os.path.join("log", "mnchecker.log")))
 
 #==========================================================
 # Formula
@@ -116,7 +128,6 @@ argumentParser.add_argument("-t", "--threshold", default=defaultThreshold,\
 
 args = argumentParser.parse_args()
 
-
 #=======================================================================================
 # Library
 #=======================================================================================
@@ -132,6 +143,11 @@ class DaemonStuckError(Exception):
 		super().__init__(message)
 
 #==========================================================
+class PathNotFoundError(Exception):
+	def __init__(self, message):
+		super().__init__(message)
+
+#==========================================================
 class Currency(object):
 	"""Represents the wallet's currency."""
 	def __init__(self, handle):
@@ -140,8 +156,10 @@ class Currency(object):
 #==========================================================
 class Process(object):
 
+	#=============================
 	"""Represents a system process started by this script.
 	Note: Refrain from calling .communicate() directly on the process from outside of this object."""
+	#=============================
 
 	def __init__(self, commandLine, run=True):
 		self.commandLine = commandLine
@@ -168,6 +186,74 @@ class Process(object):
 		return self.waitAndGetOutput(timeout)[1]
 
 #==========================================================
+class BatchPathExistenceCheckPath(object):
+	
+	#=============================
+	"""Pairs a path with an existence-check and an error message to use if it doesn't exist."""
+	#=============================
+	
+	def __init__(self, path, errorMessage):
+		self.path = path
+		self.errorMessage = errorMessage
+
+	def exists(self):
+		"""Checks whether the path exists; returns 'True' if it does, 'False' if it doesn't.
+		This also considers executable availability through $PATH, in case the specified
+		'path' is not actually a path per se, but the name of an executable available through
+		$PATH."""
+		if os.path.exists(self.path):
+			return True
+		else:
+			if shutil.which(self.path):
+				return True
+			else:
+				return False
+
+#==========================================================
+class BatchPathExistenceCheck(object):
+	
+	#=============================
+	"""Takes path+errorMessage pairs and checks whether they exist, with an optional error raised.
+	Raising the optional error is the default behaviour and needs to be disabled if
+	that is undesired."""
+	#=============================
+	
+	def __init__(self):
+		self.paths = []
+		self.batchErrorMessage = ""
+		self.nonExistentPathCount = 0
+	
+	def addPath(self, path, errorMessage):
+		self.paths.append(BatchPathExistenceCheckPath(path, errorMessage))
+	
+	def checkAll(self, autoRaiseError=True):
+		for path in self.paths:
+			if not path.exists():
+				self.nonExistentPathCount += 1
+				self.batchErrorMessage\
+					= "{batchErrorMessage}\n{errorMessage}".format(\
+					batchErrorMessage=self.batchErrorMessage, errorMessage=path.errorMessage)
+		if autoRaiseError:
+			self.raiseErrorIfNonExistentPathFound()
+	
+	def raiseErrorIfNonExistentPathFound(self):
+		if self.nonExistentPathCount > 0:
+			self.raiseError()
+	
+	def raiseError(self):
+		if self.batchErrorMessage == "":
+			raise PathNotFoundError("Error: No non-existent paths found, but error was raised anyway.")
+		elif self.nonExistentPathCount == 1:
+			raise PathNotFoundError(\
+				"Error: The following path doesn't exist:{batchErrorMessage}".format(\
+					batchErrorMessage=self.batchErrorMessage))
+		elif self.nonExistentPathCount > 1:
+			raise PathNotFoundError(\
+				"Error: The following paths don't exist:{batchErrorMessage}".format(\
+					batchErrorMessage=self.batchErrorMessage))
+			
+
+#==========================================================
 class Wallet(object):
 	
 	#=============================
@@ -180,6 +266,20 @@ class Wallet(object):
 		self.daemonBinPath = daemonBinPath
 		self.confFilePath = confFilePath
 		self.dataDirPath = dataDirPath
+		# Check path sanity.
+		batchPathExistenceCheck = BatchPathExistenceCheck()
+		batchPathExistenceCheck.addPath(self.cliBinPath, "cli-bin path: {path}".format(\
+			path=self.cliBinPath))
+		batchPathExistenceCheck.addPath(self.daemonBinPath, "daemon-bin path: {path}".format(\
+			path=self.daemonBinPath))
+		batchPathExistenceCheck.addPath(self.dataDirPath, "datadir path: {path}".format(\
+			path=self.dataDirPath))
+		if not self.confFilePath == None:
+			# A conf file path got specified; check too.
+			batchPathExistenceCheck.addPath(self.confFilePath, "conf-file path: {path}".format(\
+				path=self.confFilePath))
+		batchPathExistenceCheck.checkAll()
+		# All paths are dandy, nice!
 
 	def runCli(self, commandLine):
 		"""Run the command line version of the wallet with a list of command line arguments."""
@@ -226,7 +326,7 @@ class Wallet(object):
 					continue
 				else:
 					return retriedProcess
-			raise DaemonStuckError("Daemon stuck at error -28")
+			raise DaemonStuckError("Daemon stuck at error -28.")
 		return process
 
 	def runDaemonSafe(self, commandLine):
@@ -323,7 +423,8 @@ class BlockCountCacheFile(File):
 class BlockCountFixLockFile(File):
 	
 	#=============================
-	"""Wrapper for the file used to determine whether the wallet has recently had its blockchain reset by this script.
+	"""Wrapper for the file used to determine whether the wallet has recently had its blockchain
+	reset by this script.
 	It's not really a traditional lock file, though: It contains time data to determine whether
 	the grace waiting period to wait for the wallet's re-sync is over yet or not."""
 	#=============================
@@ -428,12 +529,15 @@ class BlockCountHealth(object):
 #=======================================================================================
 
 if __name__ == "__main__":
-	BlockCountHealth(\
-		Wallet(Currency(args.currency_handle),\
-		args.currency_bin_cli,\
-		args.currency_bin_daemon,\
-		args.currency_conf,\
-		args.currency_datadir),\
-		ExplorerzTopBlockExplorer(),\
-		threshold=args.threshold).maintain()
+	try:
+		BlockCountHealth(\
+			Wallet(Currency(args.currency_handle),\
+			args.currency_bin_cli,\
+			args.currency_bin_daemon,\
+			args.currency_conf,\
+			args.currency_datadir),\
+			ExplorerzTopBlockExplorer(),\
+			threshold=args.threshold).maintain()
+	except PathNotFoundError as error:
+		print(error)
 	sys.exit(0)
