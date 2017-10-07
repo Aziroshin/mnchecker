@@ -19,3 +19,13 @@ If you use a masternode management script of sorts, you might want to add this s
 
 Example usage:
 *mnchecker --currency-handle="vivo" --currency-bin-cli="/home/user/wallets/vivo/vivo-cli" --currency-bin-daemon="/home/user/wallets/vivo/vivod" --currency-datadir="/home/user/masternodes/vivo/kardakhim/data"*
+
+Keep in mind: If you want to execute a file in your current working directory, you'd want to prefix the filename with "./". For the above example, that would mean "./mnchecker" instead of "mnchecker". The example makes the generic assumption that "mnchecker" has been added to or linked into a directory that is globally being searched (because it is being referenced in the $PATH variable) whenever you type in a command, such as /usr/local/bin, for example.
+
+The most straightforward way to automate the recurring execution of the script would be crontab (which you can edit using the following command: *crontab -e*). To execute the above example mnchecker usage command, you'd put the following line into your crontab:
+
+\*/30 \* \* \* \* mnchecker --currency-handle="vivo" --currency-bin-cli="/home/user/wallets/vivo/vivo-cli" --currency-bin-daemon="/home/user/wallets/vivo/vivod" --currency-datadir="/home/user/masternodes/vivo/kardakhim/data" >/dev/null 2>&1
+
+WARNING: If you're reading this in pure text form and not on github (or some markdown editor or viewer), disregard all the backslash character preceding the asterisks in the above example, they are related to markdown formatting in this case and not a part of the actual line that's supposed to go into your crontab.
+
+Keep in mind that, if you have not added mnchecker to a $PATH referenced directory, you'd have to reference the absolute (full) path of the script, instead of just "mentioning" it the way the above example does. Say, if you used "git clone" in your home directory, the full path would look like this: "*/home/user/mnchecker/mnchecker*". If you downloaded the script by hand, or pasted it into an editor, you'd have to find out the absolute path of the file in question and reference that. Don't forget that absolute paths on Linux always start with a "/", so don't miss that one. :)
